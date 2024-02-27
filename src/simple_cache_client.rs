@@ -6,17 +6,18 @@ use momento_protos::{
         scs_control_client::ScsControlClient, CreateCacheRequest, CreateSigningKeyRequest,
         DeleteCacheRequest, FlushCacheRequest, ListCachesRequest, ListSigningKeysRequest,
         RevokeSigningKeyRequest,
-    },
+    }, websocket::{socket_request::cache_request, socket_response::cache_response},
 };
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 use std::convert::{TryFrom, TryInto};
 use std::iter::FromIterator;
 use std::ops::RangeBounds;
 use std::time::{Duration, UNIX_EPOCH};
 use tonic::{codegen::InterceptedService, transport::Channel, Request};
 
-use crate::compression_utils::{compress_json, decompress_json};
+use crate::{compression_utils::{compress_json, decompress_json}, data_socket::{DataSocket, Headers}};
 use crate::credential_provider::CredentialProvider;
 use crate::response::{
     DictionaryFetch, DictionaryGet, DictionaryPairs, Get, GetValue, ListCacheEntry, MomentoCache,
@@ -236,11 +237,14 @@ impl SimpleCacheClientBuilder {
         );
         let data_client = ScsClient::new(data_interceptor);
 
+        let data_socket = DataSocket::new((&self.data_endpoint).parse::<hyper::Uri>().expect("this should be a uri"), Headers::new("developer".to_string(), self.auth_token.clone()));
+
         SimpleCacheClient {
             data_endpoint: self.data_endpoint,
             control_client,
             data_client,
             item_default_ttl: self.default_ttl,
+            data_socket: Arc::new(data_socket),
         }
     }
 }
@@ -251,6 +255,7 @@ pub struct SimpleCacheClient {
     control_client: ScsControlClient<InterceptedService<Channel, HeaderInterceptor>>,
     data_client: ScsClient<InterceptedService<Channel, HeaderInterceptor>>,
     item_default_ttl: Duration,
+    data_socket: Arc<DataSocket>,
 }
 
 impl SimpleCacheClient {
@@ -515,16 +520,25 @@ impl SimpleCacheClient {
         body: impl IntoBytes,
         ttl: impl Into<Option<Duration>>,
     ) -> MomentoResult<MomentoSetResponse> {
-        let request = self.prep_request(
-            cache_name,
-            SetRequest {
-                cache_key: key.into_bytes(),
-                cache_body: body.into_bytes(),
-                ttl_milliseconds: self.expand_ttl_ms(ttl.into())?,
-            },
-        )?;
-        let _ = self.data_client.set(request).await?;
-        Ok(MomentoSetResponse::new())
+        let response = self.data_socket.run_cache_command(cache_request::Kind::Set(SetRequest {
+            cache_key: key.into_bytes(),
+            cache_body: body.into_bytes(),
+            ttl_milliseconds: self.expand_ttl_ms(ttl.into())?,
+        })).await;
+
+        match response {
+            Ok(cache_response) => {
+                match cache_response {
+                    cache_response::Kind::Set(set) => {
+                        Ok(MomentoSetResponse::new())
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Err(e) => {
+                Err(tonic::Status::new(tonic::Code::from(e.code), e.message).into())
+            }
+        }
     }
 
     /// Sets an item in a Momento Cache, compressing it first. Item must be retrieved with
@@ -602,22 +616,30 @@ impl SimpleCacheClient {
     /// # }
     /// ```
     pub async fn get(&mut self, cache_name: &str, key: impl IntoBytes) -> MomentoResult<Get> {
-        let request = self.prep_request(
-            cache_name,
-            GetRequest {
-                cache_key: key.into_bytes(),
-            },
-        )?;
+        let response = self.data_socket.run_cache_command(cache_request::Kind::Get(GetRequest {
+            cache_key: key.into_bytes(),
+        })).await;
 
-        let response = self.data_client.get(request).await?.into_inner();
-        match response.result() {
-            ECacheResult::Hit => Ok(Get::Hit {
-                value: GetValue {
-                    raw_item: response.cache_body,
-                },
-            }),
-            ECacheResult::Miss => Ok(Get::Miss),
-            _ => unreachable!(),
+        match response {
+            Ok(cache_response) => {
+                match cache_response {
+                    cache_response::Kind::Get(get) => {
+                        match get.result() {
+                            ECacheResult::Hit => Ok(Get::Hit {
+                                value: GetValue {
+                                    raw_item: get.cache_body,
+                                },
+                            }),
+                            ECacheResult::Miss => Ok(Get::Miss),
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Err(e) => {
+                Err(tonic::Status::new(tonic::Code::from(e.code), e.message).into())
+            }
         }
     }
 

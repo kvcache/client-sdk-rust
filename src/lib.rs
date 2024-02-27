@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod data_socket;
 pub mod preview;
 pub mod requests;
 pub mod response;
